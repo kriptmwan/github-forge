@@ -245,9 +245,48 @@ function selectFetchObjects(
     return { objects: [...included.values()], shallow, unshallow };
   }
 
-  // Generations of every commit reachable from the wants (tags unwrap at the same
-  // generation). Unbounded here; the depth filter is applied below.
-  const allGen = new Map<string, number>();
+  // Generations of the commits within the fetch's depth (tags unwrap at the same
+  // generation). Expansion stops at the boundary generation, so a depth-1 fetch of a
+  // 200-commit repo touches one commit, not the whole history.
+  let effectiveDepth = depth;
+  if (deepenRelative) {
+    // `deepen-relative`: depth is added to the client's current depth, read off the
+    // shallow boundaries it sent (boundary generation + 1). A targeted walk finds
+    // each boundary's generation without scanning the whole history.
+    const generationOf = (target: string): number | undefined => {
+      const seen = new Map<string, number>();
+      const q: { oid: string; gen: number }[] = [];
+      const visit = (oid: string, gen: number): void => {
+        const object = repo.objects.get(oid);
+        if (!object) return;
+        if (object.type === 'tag') {
+          visit(parseTag(object.data).object, gen);
+          return;
+        }
+        if (object.type !== 'commit' || seen.has(oid)) return;
+        seen.set(oid, gen);
+        q.push({ oid, gen });
+      };
+      for (const want of wants) visit(want, 0);
+      for (let i = 0; i < q.length; i += 1) {
+        const item = q[i] as { oid: string; gen: number };
+        if (item.oid === target) return item.gen;
+        const object = repo.objects.get(item.oid);
+        if (!object || object.type !== 'commit') continue;
+        for (const parent of parseCommit(object.data).parents) visit(parent, item.gen + 1);
+        if (q.length > 100000) return undefined;
+      }
+      return seen.get(target);
+    };
+    let current = 1;
+    for (const boundary of shallowBoundaries) {
+      const gen = generationOf(boundary);
+      if (gen !== undefined) current = Math.max(current, gen + 1);
+    }
+    effectiveDepth = current + depth;
+  }
+  const boundaryGen = effectiveDepth - 1;
+  const commitGen = new Map<string, number>();
   const queue: { oid: string; gen: number }[] = [];
   const unwrap = (oid: string, gen: number): void => {
     const object = repo.objects.get(oid);
@@ -257,34 +296,23 @@ function selectFetchObjects(
       return;
     }
     if (object.type !== 'commit') return;
-    if (allGen.has(oid)) return;
-    allGen.set(oid, gen);
+    if (commitGen.has(oid)) return;
+    commitGen.set(oid, gen);
     queue.push({ oid, gen });
   };
   for (const want of wants) unwrap(want, 0);
   for (let i = 0; i < queue.length; i += 1) {
     const item = queue[i] as { oid: string; gen: number };
+    if (item.gen >= boundaryGen) continue;
     const object = repo.objects.get(item.oid);
     if (!object || object.type !== 'commit') continue;
     for (const parent of parseCommit(object.data).parents) {
-      if (!allGen.has(parent)) {
-        allGen.set(parent, item.gen + 1);
+      if (!commitGen.has(parent)) {
+        commitGen.set(parent, item.gen + 1);
         queue.push({ oid: parent, gen: item.gen + 1 });
       }
     }
   }
-  let effectiveDepth = depth;
-  if (deepenRelative) {
-    let current = 1;
-    for (const boundary of shallowBoundaries) {
-      const gen = allGen.get(boundary);
-      if (gen !== undefined) current = Math.max(current, gen + 1);
-    }
-    effectiveDepth = current + depth;
-  }
-  const boundaryGen = effectiveDepth - 1;
-  const commitGen = new Map<string, number>();
-  for (const [oid, gen] of allGen) if (gen <= boundaryGen) commitGen.set(oid, gen);
   for (const [oid, gen] of commitGen) {
     const object = repo.objects.get(oid);
     if (!object) continue;
